@@ -2,94 +2,91 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.regularizers import l1_l2
-from keras_tuner import RandomSearch
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import os
 
-# Load data
-df = pd.read_csv('data_tables/processed_EDIRNE-17050Station.csv')
+plot_dir = "model_plots"
+if not os.path.exists(plot_dir):
+    os.makedirs(plot_dir)
 
-# Normalize data
-scaler = MinMaxScaler(feature_range=(0, 1))
-scaled_data = scaler.fit_transform(df)
-
-# Prepare sequences for LSTM
-def create_sequences(data, seq_length):
-    xs, ys = [], []
-    for i in range(len(data) - seq_length):
-        xs.append(data[i:(i + seq_length)])
-        ys.append(data[i + seq_length])
-    return np.array(xs), np.array(ys)
-
-seq_length = 12  # Number of months
-X, y = create_sequences(scaled_data, seq_length)
-
-# Split the data
-train_size = int(len(X) * 0.8)
-val_size = int(len(X) * 0.1)
-X_train, y_train = X[:train_size], y[:train_size]
-X_val, y_val = X[train_size:train_size + val_size], y[train_size:train_size + val_size]
-X_test, y_test = X[train_size + val_size:], y[train_size + val_size:]
-
-# Convert data to float32
-X_train = np.asarray(X_train).astype(np.float32)
-y_train = np.asarray(y_train).astype(np.float32)
-X_val = np.asarray(X_val).astype(np.float32)
-y_val = np.asarray(y_val).astype(np.float32)
-X_test = np.asarray(X_test).astype(np.float32)
-y_test = np.asarray(y_test).astype(np.float32)
-
-# Define the model-building function for Keras Tuner
-def build_model(hp):
+# Function to create an LSTM model
+def create_model(input_shape, output_units):
     model = Sequential()
-    model.add(LSTM(units=hp.Int('units', min_value=32, max_value=512, step=32),
-                   activation='relu',
-                   input_shape=(seq_length, X_train.shape[2])))
-    model.add(Dropout(hp.Float('dropout', min_value=0.0, max_value=0.5, default=0.25, step=0.05)))
-    model.add(Dense(y_train.shape[1], activation='relu'))
+    model.add(LSTM(50, activation='relu', input_shape=input_shape, kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4)))
+    model.add(Dropout(0.2))
+    model.add(Dense(output_units, activation='relu'))
     model.compile(optimizer='adam', loss='mean_squared_error')
     return model
 
-# Run Keras Tuner
-tuner = RandomSearch(
-    build_model,
-    objective='loss',
-    max_trials=10,
-    executions_per_trial=1,
-    directory='my_dir',
-    project_name='lstm_weather_forecast'
-)
+# Function to preprocess the data
+def preprocess_data(file_path, seq_length=12):
+    df = pd.read_csv(file_path)
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(df.iloc[:, 2:])
 
-tuner.search(X_train, y_train, epochs=10, validation_data=(X_val, y_val))
+    X, y = [], []
+    for i in range(len(scaled_data) - seq_length):
+        X.append(scaled_data[i:(i + seq_length)])
+        y.append(scaled_data[i + seq_length])
+    X, y = np.array(X), np.array(y)
 
-# Retrieve the best model
-best_model = tuner.get_best_models(num_models=1)[0]
+    train_size = int(len(X) * 0.8)
+    val_size = int(len(X) * 0.1)
+    X_train, y_train = X[:train_size], y[:train_size]
+    X_val, y_val = X[train_size:train_size + val_size], y[train_size:train_size + val_size]
+    X_test, y_test = X[train_size + val_size:], y[train_size + val_size:]
 
-# Train the best model further
-history = best_model.fit(X_train, y_train, epochs=50, validation_data=(X_val, y_val))
+    return X_train, y_train, X_val, y_val, X_test, y_test, scaler, df.columns[2:]
 
-# Save the best model
-best_model.save('best_lstm_model.keras')
+# Function to evaluate predictions
+def evaluate_predictions(predictions, actuals, feature_names):
+    mae = mean_absolute_error(actuals, predictions)
+    mse = mean_squared_error(actuals, predictions)
+    rmse = np.sqrt(mse)
 
-# Evaluate the best model
-best_model.evaluate(X_test, y_test)
+    print(f"Mean Absolute Error (MAE): {mae}")
+    print(f"Mean Squared Error (MSE): {mse}")
+    print(f"Root Mean Squared Error (RMSE): {rmse}")
 
-# Forecasting
-predictions = best_model.predict(X_test)
+    # Plot and save each feature comparison
+    for i, feature_name in enumerate(feature_names):
+        plt.figure(figsize=(10, 6))
+        plt.plot(actuals[:, i], label='Actual', marker='o')
+        plt.plot(predictions[:, i], label='Predicted', marker='x')
+        plt.title(f'{feature_name} Prediction vs Actual')
+        plt.xlabel('Samples')
+        plt.ylabel('Value')
+        plt.legend()
+        plt.savefig(os.path.join(plot_dir, f'{feature_name}_prediction_vs_actual.png'))
+        plt.close()
 
-# Iterate over each feature in the dataset
-for i in range(y_test.shape[1]):
-    if i < 2: # Skip month and year columns
-        continue
-    plt.figure(figsize=(12, 4))  # Create a new figure for each plot
-    plt.plot(y_test[:, i], label=f'Actual {df.columns[i]}')
-    plt.plot(predictions[:, i], label=f'Predicted {df.columns[i]}')
-    plt.title(f'Prediction of {df.columns[i]}')
-    plt.xlabel('Time Steps')
-    plt.ylabel(df.columns[i])
+# Function to plot training history
+def plot_training_history(history, plot_dir, metric='loss'):
+    plt.figure(figsize=(10, 6))
+    plt.plot(history.history[metric], label='Train')
+    plt.plot(history.history[f'val_{metric}'], label='Validation')
+    plt.title(f'Model {metric.title()}')
+    plt.xlabel('Epoch')
+    plt.ylabel(metric.title())
     plt.legend()
-    # Save the plot as an image file
-    plt.savefig(f'plot_{df.columns[i]}.png')
+    plt.savefig(os.path.join(plot_dir, f'model_{metric}_plot.png'))
+    plt.close()
 
-    # plt.show()  # Display the plot
+# Example usage for a single dataset
+file_path = 'data_tables/processed_EDIRNE-17050Station.csv'
+X_train, y_train, X_val, y_val, X_test, y_test, scaler, feature_names = preprocess_data(file_path)
+
+model = create_model(X_train.shape[1:], y_train.shape[1])
+history = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=32)
+
+# Plot training history
+plot_training_history(history, plot_dir, 'loss')
+
+# Predictions and evaluation
+predictions = model.predict(X_test)
+predictions_inverse = scaler.inverse_transform(predictions)
+y_test_inverse = scaler.inverse_transform(y_test)
+evaluate_predictions(predictions_inverse, y_test_inverse, feature_names)
